@@ -1,117 +1,75 @@
 # AdaTP Node.js SDK
 
-A robust, type-safe Node.js client for the Ada Transport Protocol (AdaTP). This SDK provides a simple API to connect to AdaTP servers, perform secure handshakes, and exchange confidential messages.
+A high-performance, strongly-typed Node.js/TypeScript client library for the **Ada Transfer Protocol (AdaTP)**. This SDK implementation fully supports X25519/AES-256-GCM encryption, room management, and efficient chunked file transfers.
 
-## Features
+## 📦 Features
+*   **Secure:** Built-in End-to-End Encryption (Handshake + Session).
+*   **Typed:** Written in TypeScript with full type definitions.
+*   **Async/Await:** Modern, promise-based API for connection and logic.
+*   **Files:** Built-in helpers for streaming file uploads and downloads.
 
-- **Secure Handshake**: Full implementation of the AdaTP handshake using X25519 key exchange and HKDF key derivation.
-- **End-to-End Encryption**: All messages after handshake are encrypted using AES-256-GCM.
-- **Type-Safe**: Written in TypeScript with complete type definitions.
-- **Protocol Compliant**: Fully compatible with the official AdaTP Rust server.
-
-## Installation
+## 🚀 Installation
 
 ```bash
-npm install adatp-sdk
-# or locally
-npm install ./path/to/adatp/sdks/nodejs
+npm install
+npm run build
 ```
 
-*Note: This package requires Node.js v16+ for native crypto support.*
+## 🛠️ Usage
 
-## Usage
-
-### Basic Connection
+### 1. Basic Chat Client
 
 ```typescript
-import { AdaTPClient } from 'adatp-sdk';
+import { AdaTPClient } from './src/client';
 
 async function main() {
-    // Initialize client connecting to localhost:8443
-    const client = new AdaTPClient('127.0.0.1', 8443);
+    // 1. Initialize
+    const client = new AdaTPClient('127.0.0.1', 8444);
 
     try {
-        console.log("Connecting...");
-        // Connects and performs the secure handshake automatically
+        // 2. Connect & Handshake
         await client.connect();
+
+        // 3. Authenticate
+        await client.authenticate("username", "password");
+
+        // 4. Handle Incoming Messages
+        client.setMessageHandler((sender, text) => {
+             console.log(`[${sender}] ${text}`);
+        });
         
-        console.log("Secure session established!");
+        // 5. Join Room
+        await client.joinRoom("general");
 
-        // Send an encrypted text message
-        await client.sendTextMessage("Hello from Node.js!");
+        // 6. Send Message
+        await client.sendTextMessage("Hello World!");
 
-        // Graceful disconnect
-        await client.disconnect();
-    } catch (error) {
-        console.error("Connection failed:", error);
+    } catch (err) {
+        console.error("Error:", err);
     }
 }
-
 main();
 ```
 
-### API Reference
+### 2. File Transfer
 
-#### `class AdaTPClient`
+The SDK provides low-level control for handling file packets (`FileInit`, `FileChunk`, `FileComplete`).
 
-**Constructor**
+**Sending a File:**
 ```typescript
-new AdaTPClient(host: string, port: number)
-```
-Creates a new client instance.
-
-**Methods**
-
-- **`connect(): Promise<void>`**
-  Establishes a TCP connection and performs the cryptographic handshake. Resolves when the session is secure and ready.
-
-- **`sendTextMessage(text: string): Promise<void>`**
-  Encrypts and sends a UTF-8 text message to the server. Waits for and logs an echo response (default behavior).
-
-- **`disconnect(): Promise<void>`**
-  Sends a `DISCONNECT` packet to the server and closes the socket.
-
-## Development
-
-1. **Install Dependencies**
-   ```bash
-   npm install
-   ```
-
-2. **Build**
-   ```bash
-   npm run build
-   ```
-
-3. **Run Example**
-   ```bash
-   npx ts-node src/client.ts
-   ```
-
-## Protocol Support
-
-| Feature | Status |
-|---------|--------|
-| Handshake (X25519) | ✅ |
-| Encryption (AES-GCM) | ✅ |
-| Text Messages | ✅ |
-| Multi-Room Chat | ✅ |
-| File Transfer | ✅ (Implemented) |
-| Voice/Video | 🚧 (Planned) |
-
-### Multi-Room Support
-
-```typescript
-// Join a specific room
-await client.joinRoom('general');
-
-// Listen for incoming messages
-client.setMessageHandler((sender, text) => {
-    console.log(`[${sender}]: ${text}`);
-});
+await client.sendFile("/path/to/large_file.zip");
 ```
 
-## License
+**Receiving a File:**
+Receiving involves listening for packet types. See `filetransfer_example.ts` for a complete implementation of a robust download manager.
 
-MIT
-# SDK-NodeJS
+## 📂 Examples
+
+*   **Chat CLI:** `npx ts-node example.ts`
+    *   Interactive command-line chat application.
+*   **File Transfer:** `npx ts-node filetransfer_example.ts`
+    *   Demonstrates sending a generated text file and receiving broadcasts back to the `downloads/` folder.
+
+## 🔧 Configuration
+
+The client connects to `127.0.0.1:8444` by default. Ensure your AdaTP server is running and accessible.
