@@ -1,0 +1,2 @@
+These are the contents of the test file.
+Hello AdaTP File Transfer!

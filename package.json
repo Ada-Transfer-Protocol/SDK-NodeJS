@@ -1,0 +1,21 @@
+{
+    "name": "adatp",
+    "version": "0.1.0",
+    "description": "Ada Transport Protocol SDK for Node.js",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "scripts": {
+        "build": "tsc",
+        "start": "ts-node src/index.ts"
+    },
+    "dependencies": {
+        "hkdf": "^0.0.2",
+        "uuid": "^13.0.0"
+    },
+    "devDependencies": {
+        "@types/node": "^25.0.10",
+        "@types/uuid": "^11.0.0",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.9.3"
+    }
+}
