@@ -6,7 +6,7 @@ import { MessageType, PacketFlags } from './src/protocol';
 import { v4 as uuidv4, stringify as uuidStringify } from 'uuid';
 
 async function main() {
-    const client = new AdaTPClient('localhost', 8444);
+    const client = new AdaTPClient('localhost', 3000);
 
     // Setup Downloads Dir
     const downloadDir = path.join(__dirname, 'downloads');
