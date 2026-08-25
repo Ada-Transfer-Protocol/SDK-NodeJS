@@ -15,7 +15,7 @@ async function main() {
 
     const username = await ask("Enter your username: ");
     const password = await ask("Enter your password (default: secret_password): ") || "secret_password";
-    const client = new AdaTPClient('127.0.0.1', 8444);
+    const client = new AdaTPClient('127.0.0.1', 3000);
 
     try {
         console.log("Connecting...");

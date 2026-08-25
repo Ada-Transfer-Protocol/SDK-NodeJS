@@ -1,401 +1,372 @@
-import * as net from 'net';
-import { generateKeyPairSync, createECDH } from 'crypto';
+import WebSocket from 'ws';
 import * as fs from 'fs';
 import * as path from 'path';
 import { v4 as uuidv4, parse as uuidParse } from 'uuid';
 import {
-    Packet, PacketHeader, Codec as PacketCodec,
+    Packet, Codec as PacketCodec,
     MessageType, PacketFlags, MAGIC_NUMBER, HEADER_SIZE
 } from './protocol';
 import { CryptoSession } from './crypto';
 
-// Polyfill for X25519 if not available in older node versions (but we assume Node 16+)
-// Node's crypto does not easily support raw X25519 DH with custom keys for some reason in convenient way matching Rust.
-// We might need 'curve25519-js' or similar if built-in fails.
-// But let's try 'crypto.diffieHellman' or 'generateKeyPair' with type 'x25519'.
-
-const { generateKeyPairSync: genKey, diffieHellman } = require('crypto');
+export interface AdaTPClientOptions {
+    /** WebSocket path on the server. Default: "/ws". */
+    path?: string;
+    /** Use wss:// instead of ws:// when constructing from host+port. */
+    secure?: boolean;
+}
 
 /**
- * AdaTP Client for Node.js
- * 
- * Manages the TCP connection, secure session state, and protocol messaging.
- * usage:
+ * AdaTP client for Node.js.
+ *
+ * Transport is WebSocket (binary frames, one AdaTP packet per message).
+ * The connection is upgraded to an encrypted session via an X25519 handshake
+ * (HKDF-SHA256 key derivation, AES-256-GCM packet encryption).
+ *
  * ```ts
- * const client = new AdaTPClient('localhost', 8443);
- * await client.connect();
+ * const client = new AdaTPClient('127.0.0.1', 3000);
+ * await client.connect();                      // WS + secure handshake
+ * await client.authenticate('user1', 'password123');
+ * await client.joinRoom('lobby');
+ * await client.sendTextMessage('Hello!');
  * ```
+ *
+ * A full URL is also accepted: `new AdaTPClient('ws://example.com:3000/ws')`.
  */
 export class AdaTPClient {
-    private socket: net.Socket;
-    private host: string;
-    private port: number;
-    private buffer: Buffer;
+    private url: string;
+    private ws: WebSocket | null = null;
     private cryptoSession?: CryptoSession;
     private sessionId: Buffer;
 
-    /**
-     * Creates an instance of AdaTPClient.
-     * @param host The server hostname or IP address.
-     * @param port The server port (default typically 8443).
-     */
-    constructor(host: string, port: number) {
-        this.host = host;
-        this.port = port;
-        this.socket = new net.Socket();
-        this.buffer = Buffer.alloc(0);
+    private pendingResolvers: Array<(p: Packet) => void> = [];
+    private inbox: Packet[] = [];
+    private messageHandler: ((sender: string, text: string) => void) | null = null;
+    private gameStateHandler: ((sender: string, state: any) => void) | null = null;
+    private toolPending = new Map<string, (p: Packet) => void>();
+    private closed = false;
 
-        // Generate random session ID for client side reference, 
-        // though server usually sets it on response?
-        // Protocol says SessionID is in header. It should be consistent.
-        // Let's generate a temporary one.
-        const uuid = uuidv4();
-        this.sessionId = Buffer.alloc(16);
-        // Parsing UUID string to buffer is tricky without helper.
-        // Using uuid.parse to write to buffer.
-        // uuidParse(uuid, this.sessionId); // Requires the buffer to be passed?
-        // uuidParse returns Uint8Array usually.
-        const parsed = uuidParse(uuid);
-        Buffer.from(parsed).copy(this.sessionId);
-    }
-
-    /**
-     * Establishes connection to the server and performs the handshake.
-     * @returns Promise that resolves when the secure session is established.
-     * @throws Error if connection or handshake fails.
-     */
-    public async connect(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            this.socket.connect(this.port, this.host, async () => {
-                console.log('Connected to server');
-                try {
-                    await this.handshake();
-                    resolve();
-                } catch (e) {
-                    reject(e);
-                }
-            });
-
-            this.socket.on('data', (data: Buffer) => {
-                this.buffer = Buffer.concat([this.buffer, data]);
-                this.processBuffer();
-            });
-
-            this.socket.on('error', (err: any) => {
-                console.error("Socket error:", err);
-            });
-
-            this.socket.on('close', () => {
-                console.log("Connection closed");
-            });
-        });
-    }
-
-    private async handshake() {
-        // 1. Generate Ephemeral Keys (X25519)
-        const kp = genKey('x25519');
-        const myPriv = kp.privateKey;
-        const myPub = kp.publicKey;
-
-        // Extract raw 32 bytes from SPKI DER
-        const myPubDer: Buffer = myPub.export({ format: 'der', type: 'spki' });
-        // X25519 SPKI DER is 44 bytes. Last 32 is the key.
-        const myRawPub = myPubDer.subarray(myPubDer.length - 32);
-
-        // 2. Send HANDSHAKE_INIT
-        const initPacket = this.createPacket(MessageType.HandshakeInit, myRawPub);
-        this.sendPacket(initPacket);
-
-        // 3. Wait for HANDSHAKE_RESPONSE
-        const responsePacket = await this.readNextPacket();
-        if (responsePacket.header.msgType !== MessageType.HandshakeResponse) {
-            throw new Error(`Expected HandshakeResponse, got ${responsePacket.header.msgType}`);
+    constructor(hostOrUrl: string, port?: number, options: AdaTPClientOptions = {}) {
+        if (hostOrUrl.startsWith('ws://') || hostOrUrl.startsWith('wss://')) {
+            this.url = hostOrUrl;
+        } else {
+            const scheme = options.secure ? 'wss' : 'ws';
+            const p = port ?? 3000;
+            const wsPath = options.path ?? '/ws';
+            this.url = `${scheme}://${hostOrUrl}:${p}${wsPath}`;
         }
 
-        const serverPubKey = responsePacket.payload.subarray(0, 32);
+        this.sessionId = Buffer.alloc(16);
+        Buffer.from(uuidParse(uuidv4())).copy(this.sessionId);
+    }
 
-        // 4. Compute Shared Secret
-        const secret = require('crypto').diffieHellman({
-            publicKey: require('crypto').createPublicKey({
+    /** Client identity as sent in every packet header (hex). */
+    public getSessionId(): string {
+        return this.sessionId.toString('hex');
+    }
+
+    /**
+     * Opens the WebSocket and performs the X25519 secure handshake.
+     */
+    public async connect(): Promise<void> {
+        await new Promise<void>((resolve, reject) => {
+            const ws = new WebSocket(this.url);
+            this.ws = ws;
+
+            ws.on('open', () => resolve());
+            ws.on('message', (data: WebSocket.RawData) => {
+                const buf = Array.isArray(data)
+                    ? Buffer.concat(data)
+                    : Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+                this.handleIncoming(buf);
+            });
+            ws.on('error', (err) => reject(err));
+            ws.on('close', () => { this.closed = true; });
+        });
+
+        await this.handshake();
+    }
+
+    private async handshake(): Promise<void> {
+        const { generateKeyPairSync, diffieHellman, createPublicKey } = require('crypto');
+
+        // 1. Ephemeral X25519 key pair; raw public key = last 32 bytes of SPKI DER.
+        const kp = generateKeyPairSync('x25519');
+        const myPubDer: Buffer = kp.publicKey.export({ format: 'der', type: 'spki' });
+        const myRawPub = myPubDer.subarray(myPubDer.length - 32);
+
+        // 2. HANDSHAKE_INIT carries our public key.
+        this.sendPacket(this.createPacket(MessageType.HandshakeInit, Buffer.from(myRawPub)));
+
+        // 3. HANDSHAKE_RESPONSE carries the server's public key.
+        const response = await this.readNextPacketOfType([MessageType.HandshakeResponse]);
+        if (response.payload.length < 32) {
+            throw new Error('Server did not provide a key (plaintext-only server?)');
+        }
+        const serverPub = response.payload.subarray(0, 32);
+
+        // 4. Shared secret + session keys.
+        const secret = diffieHellman({
+            publicKey: createPublicKey({
                 key: Buffer.concat([
-                    Buffer.from("302a300506032b656e032100", "hex"), // X25519 SPKI Prefix
-                    serverPubKey
+                    Buffer.from('302a300506032b656e032100', 'hex'), // X25519 SPKI prefix
+                    serverPub
                 ]),
                 format: 'der',
                 type: 'spki'
             }),
-            privateKey: myPriv
+            privateKey: kp.privateKey
         });
-
-        // 5. Init Crypto Session
         this.cryptoSession = new CryptoSession('client', secret);
 
-        // 6. Send HANDSHAKE_COMPLETE
-        const verifyMsg = Buffer.from("Verification OK");
-        const { ciphertext, authTag, sequence } = this.cryptoSession.encrypt(verifyMsg);
-
-        const completePacket = this.createPacket(MessageType.HandshakeComplete, ciphertext);
-        completePacket.header.flags |= PacketFlags.Encrypted;
-        completePacket.header.sequence = sequence;
-        completePacket.authTag = authTag;
-
-        this.sendPacket(completePacket);
-        console.log("Handshake Complete!");
+        // 5. HANDSHAKE_COMPLETE proves we derived the same keys.
+        const { ciphertext, authTag, sequence } = this.cryptoSession.encrypt(Buffer.from('Verification OK'));
+        const complete = this.createPacket(MessageType.HandshakeComplete, ciphertext);
+        complete.header.flags |= PacketFlags.Encrypted;
+        complete.header.sequence = sequence;
+        complete.authTag = authTag;
+        this.sendPacket(complete);
     }
 
-    // ... Helper implementations for readNextPacket, etc.
+    /**
+     * Sends credentials; resolves with the server-assigned identity or throws
+     * on AuthFailure.
+     */
+    public async authenticate(username: string, password: string): Promise<{ user_id: string, username: string, role: string }> {
+        const body = Buffer.from(JSON.stringify({ username, password }), 'utf-8');
+        this.sendSecure(MessageType.AuthRequest, body);
 
-    private createPacket(type: MessageType, payload: Buffer): Packet {
-        return {
-            header: {
-                magic: MAGIC_NUMBER,
-                version: 1,
-                flags: 0,
-                length: payload.length,
-                sequence: 0n, // Default, overridden if encrypted
-                msgType: type,
-                timestamp: BigInt(Date.now()),
-                sessionId: this.sessionId
-            },
-            payload: payload
-        };
+        const response = await this.readNextPacketOfType([MessageType.AuthSuccess, MessageType.AuthFailure]);
+        const plaintext = this.decryptIfNeeded(response);
+
+        if (response.header.msgType === MessageType.AuthSuccess) {
+            return JSON.parse(plaintext.toString('utf-8'));
+        }
+        throw new Error(`Authentication failed: ${plaintext.toString('utf-8')}`);
     }
 
-    private sendPacket(packet: Packet) {
-        console.log(`Sending Packet: Type=${packet.header.msgType}, Len=${packet.payload.length}, Flags=${packet.header.flags}`);
-        const buf = PacketCodec.encode(packet);
-        // console.log("Hex:", buf.toString('hex'));
-        this.socket.write(buf);
+    /** Joins a room; resolves once the server confirms with RoomJoined. */
+    public async joinRoom(room: string): Promise<string> {
+        this.sendSecure(MessageType.JoinRoom, Buffer.from(room, 'utf-8'));
+        const response = await this.readNextPacketOfType([MessageType.RoomJoined, MessageType.AuthFailure]);
+        const plaintext = this.decryptIfNeeded(response);
+        if (response.header.msgType === MessageType.RoomJoined) {
+            return plaintext.toString('utf-8');
+        }
+        throw new Error(`Join failed: ${plaintext.toString('utf-8')}`);
     }
 
-    private pendingResolver: ((p: Packet) => void) | null = null;
-    private messageHandler: ((sender: string, text: string) => void) | null = null;
+    /** Sends an encrypted text message to the current room. */
+    public async sendTextMessage(text: string): Promise<void> {
+        this.sendSecure(MessageType.TextMessage, Buffer.from(text, 'utf-8'));
+    }
 
+    /** Streams a file to the current room (FileInit → FileChunk* → FileComplete). */
+    public async sendFile(filePath: string): Promise<void> {
+        const buffer = fs.readFileSync(filePath);
+        const fileId = uuidv4();
+        const fileIdBuf = Buffer.from(uuidParse(fileId) as Uint8Array);
+
+        const initJson = JSON.stringify({ id: fileId, filename: path.basename(filePath), size: buffer.length });
+        this.sendSecure(MessageType.FileInit, Buffer.from(initJson));
+
+        const CHUNK_SIZE = 16384;
+        for (let offset = 0; offset < buffer.length; offset += CHUNK_SIZE) {
+            const chunk = buffer.subarray(offset, Math.min(offset + CHUNK_SIZE, buffer.length));
+            this.sendSecure(MessageType.FileChunk, Buffer.concat([fileIdBuf, chunk]));
+            await new Promise(r => setTimeout(r, 2)); // gentle pacing
+        }
+
+        this.sendSecure(MessageType.FileComplete, fileIdBuf);
+    }
+
+    /** Handler for asynchronous text messages (chat traffic). */
     public setMessageHandler(handler: (sender: string, text: string) => void) {
         this.messageHandler = handler;
     }
 
-    private processBuffer() {
-        if (this.buffer.length < HEADER_SIZE) return;
+    // ------------------------------------------------------------------
+    // GameState (0x0050) — room-routed opaque state, JSON recommended
+    // ------------------------------------------------------------------
 
-        const length = this.buffer.readUInt32LE(7);
-        const flags = this.buffer.readUInt16LE(5);
-        const isEncrypted = (flags & PacketFlags.Encrypted) !== 0;
-        const extra = isEncrypted ? 16 : 0;
-        const totalLen = HEADER_SIZE + length + extra;
+    /** Broadcasts a game state to the current room. Objects are JSON-encoded. */
+    public async sendGameState(state: object | Buffer): Promise<void> {
+        const payload = Buffer.isBuffer(state)
+            ? state
+            : Buffer.from(JSON.stringify(state), 'utf-8');
+        this.sendSecure(MessageType.GameState, payload);
+    }
 
-        if (this.buffer.length >= totalLen) {
-            const raw = this.buffer.subarray(0, totalLen);
-            this.buffer = this.buffer.subarray(totalLen);
+    /** Handler for incoming game states (parsed as JSON when possible). */
+    public setGameStateHandler(handler: (sender: string, state: any) => void) {
+        this.gameStateHandler = handler;
+    }
 
-            const packet = this.parsePacketBytes(raw);
+    /** Resolves with the next GameState payload (JSON-parsed when possible). */
+    public async readNextGameState(): Promise<any> {
+        const packet = await this.readNextPacketOfType([MessageType.GameState]);
+        return this.parseGamePayload(packet);
+    }
 
-            if (this.pendingResolver) {
-                this.pendingResolver(packet);
-                this.pendingResolver = null;
-            } else {
-                // Handle async messages (Chat)
-                if (packet.header.msgType === MessageType.TextMessage && this.cryptoSession) {
-                    if ((packet.header.flags & PacketFlags.Encrypted)) {
-                        try {
-                            const plaintext = this.cryptoSession.decrypt(packet);
-                            // We don't have sender info in protocol yet, so sender is unknown or we parse it from text if protocol changed?
-                            // Server broadcast sends: [Addr] Message
-                            // Actually server sends RAW BYTES of `decrypted`.
-                            // So plaintext IS the message.
-                            // The protocol doesn't have sender field in Header yet.
-                            // Server embeds sender in text? 
-                            // In `handle_connection` server did `tx.send((addr, decrypted))`.
-                            // But when sending to client: `secure_session.encrypt(&content)`.
-                            // `content` is just `decrypted` bytes.
-                            // Wait, server DOES NOT prepend sender in the content sent to client in my rust code?
-                            // Rust: `secure_session.encrypt(&content)` where content is `decrypted`.
-                            // So client receives exactly what sender sent.
-                            // EXCEPT if I changed server logic?
-                            // Ah, in PHP test we saw `< [ali] selam`.
-                            // This format was done by PHP client: `$msg = "[$username] $line";`.
-                            // So the text itself contains sender.
-                            const text = plaintext.toString('utf-8');
-                            if (this.messageHandler) {
-                                this.messageHandler("Server", text); // Sender is embedded in text
-                            } else {
-                                console.log("Received:", text);
-                            }
-                        } catch (e) {
-                            console.error("Decrypt error", e);
-                        }
-                    }
-                } else {
-                    // console.log("Received packet:", packet.header.msgType);
-                }
+    private parseGamePayload(packet: Packet): any {
+        const raw = this.decryptIfNeeded(packet);
+        try { return JSON.parse(raw.toString('utf-8')); } catch { return raw; }
+    }
+
+    // ------------------------------------------------------------------
+    // Tools (0x0070-0x0072) — plugin tool platform
+    // ------------------------------------------------------------------
+
+    /**
+     * Calls a server-side tool and resolves with its result.
+     * Rejects with the tool error (code + message) on ToolError.
+     */
+    public async callTool(tool: string, args: object = {}, timeoutMs = 15000): Promise<any> {
+        const id = uuidv4();
+        const body = Buffer.from(JSON.stringify({ id, tool, args }), 'utf-8');
+
+        const resultPromise = new Promise<Packet>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.toolPending.delete(id);
+                reject(new Error(`Tool call '${tool}' timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+            this.toolPending.set(id, (p) => { clearTimeout(timer); resolve(p); });
+        });
+
+        this.sendSecure(MessageType.ToolCall, body);
+        const packet = await resultPromise;
+        const parsed = JSON.parse(this.decryptIfNeeded(packet).toString('utf-8'));
+
+        if (packet.header.msgType === MessageType.ToolResult && parsed.ok) {
+            return parsed.result;
+        }
+        const err = parsed.error ?? { code: 'tool_failed', message: 'unknown error' };
+        const e: any = new Error(`Tool '${tool}' failed: ${err.code}: ${err.message}`);
+        e.code = err.code;
+        throw e;
+    }
+
+    /** Lists the tools available on the server (built-in system.list_tools). */
+    public async listTools(): Promise<Array<{ name: string, description: string, schema: object, plugin: string }>> {
+        const result = await this.callTool('system.list_tools', {});
+        return result.tools ?? [];
+    }
+
+    /** Resolves with the next decrypted TextMessage (skips other packets). */
+    public async readNextTextMessage(): Promise<string> {
+        while (true) {
+            const packet = await this.readNextPacket();
+            if (packet.header.msgType === MessageType.TextMessage) {
+                return this.decryptIfNeeded(packet).toString('utf-8');
             }
-
-            this.processBuffer();
         }
     }
 
-    private parsePacketBytes(raw: Buffer): Packet {
-        // Manual parse similar to Rust 'from_bytes'
-        // ...
-        // For now return dummy
-
-        const magic = raw.readUInt32LE(0);
-        // ...
-
-        const msgType = raw.readUInt16LE(22); // Offset
-        // Wait, offsets in RFC:
-        // Magic(0): 4
-        // Version(4): 1
-        // Flags(5): 2
-        // Length(7): 4
-        // Sequence(11): 8
-        // MsgType(19): 2
-        // Timestamp(21): 8
-        // Session(29): 16
-        // Header Size: 45
-
-        // Correct offset for MsgType is 19.
-        const type = raw.readUInt16LE(19);
-        const length = raw.readUInt32LE(7);
-        const flags = raw.readUInt16LE(5);
-
-        const payload = raw.subarray(HEADER_SIZE, HEADER_SIZE + length);
-
-        let authTag: Buffer | undefined = undefined;
-        if ((flags & PacketFlags.Encrypted) !== 0) {
-            // AuthTag is AFTER payload
-            const tagStart = HEADER_SIZE + length;
-            authTag = raw.subarray(tagStart, tagStart + 16);
-        }
-
-        const packet: Packet = {
-            header: {
-                magic,
-                version: raw.readUInt8(4),
-                flags: flags,
-                length: length,
-                sequence: raw.readBigUInt64LE(11),
-                msgType: type,
-                timestamp: raw.readBigUInt64LE(21),
-                sessionId: raw.subarray(29, 45)
-            },
-            payload,
-            authTag
-        };
-
-        return packet;
-    }
-
+    /** Resolves with the next packet (inbox first, then live traffic). */
     public readNextPacket(): Promise<Packet> {
+        const queued = this.inbox.shift();
+        if (queued) return Promise.resolve(queued);
         return new Promise(resolve => {
-            this.pendingResolver = resolve;
+            this.pendingResolvers.push(resolve);
         });
     }
+
     /**
-     * Sends an encrypted text message to the server.
-     * @param text The message string to send.
+     * Resolves with the next packet whose type is in `types`; unrelated
+     * packets (e.g. presence updates or chat traffic arriving mid-request)
+     * are queued for later consumption instead of being lost.
      */
-    public async sendTextMessage(text: string): Promise<void> {
-        if (!this.cryptoSession) throw new Error("No session");
+    public async readNextPacketOfType(types: number[], timeoutMs = 10000): Promise<Packet> {
+        const idx = this.inbox.findIndex(p => types.includes(p.header.msgType));
+        if (idx >= 0) return this.inbox.splice(idx, 1)[0];
 
-        const payload = Buffer.from(text, 'utf-8');
-        const { ciphertext, authTag, sequence } = this.cryptoSession.encrypt(payload);
-
-        const packet = this.createPacket(MessageType.TextMessage, ciphertext);
-        packet.header.flags |= PacketFlags.Encrypted;
-        packet.header.sequence = sequence;
-        packet.authTag = authTag;
-
-        this.sendPacket(packet);
-        // Echo will be handled by message handler
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            const packet = await new Promise<Packet | null>(resolve => {
+                const entry = (p: Packet) => { clearTimeout(timer); resolve(p); };
+                const timer = setTimeout(() => {
+                    const i = this.pendingResolvers.indexOf(entry);
+                    if (i >= 0) this.pendingResolvers.splice(i, 1);
+                    resolve(null);
+                }, Math.max(1, deadline - Date.now()));
+                this.pendingResolvers.push(entry);
+            });
+            if (!packet) break;
+            if (types.includes(packet.header.msgType)) return packet;
+            this.inbox.push(packet);
+        }
+        throw new Error(`Timeout waiting for packet of type [${types.map(t => '0x' + t.toString(16)).join(', ')}]`);
     }
 
-    public async joinRoom(room: string): Promise<void> {
-        if (!this.cryptoSession) throw new Error("No secure session");
-
-        const payload = Buffer.from(room, 'utf-8');
-        const { ciphertext, authTag, sequence } = this.cryptoSession.encrypt(payload);
-
-        const packet = this.createPacket(MessageType.JoinRoom, ciphertext);
-        packet.header.flags |= PacketFlags.Encrypted;
-        packet.header.sequence = sequence;
-        packet.authTag = authTag;
-
-        this.sendPacket(packet);
-        console.log(`Joined room: ${room}`);
+    /** Sends Disconnect and closes the socket. */
+    public async disconnect(): Promise<void> {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.sendPacket(this.createPacket(MessageType.Disconnect, Buffer.alloc(0)));
+            this.ws.close();
+        }
+        this.closed = true;
     }
 
-    public async authenticate(username: string, password: string): Promise<void> {
-        if (!this.cryptoSession) throw new Error("No session");
+    // ------------------------------------------------------------------
+    // Internals
+    // ------------------------------------------------------------------
 
-        const payload = Buffer.from(JSON.stringify({ username, password }), 'utf-8');
-        const { ciphertext, authTag, sequence } = this.cryptoSession.encrypt(payload);
+    private handleIncoming(raw: Buffer) {
+        if (raw.length < HEADER_SIZE || raw.readUInt32LE(0) !== MAGIC_NUMBER) return;
+        const packet = this.parsePacketBytes(raw);
 
-        const packet = this.createPacket(MessageType.AuthRequest, ciphertext);
-        packet.header.flags |= PacketFlags.Encrypted;
-        packet.header.sequence = sequence;
-        packet.authTag = authTag;
+        // Tool results are correlated by id and never enter the general queue.
+        if (packet.header.msgType === MessageType.ToolResult ||
+            packet.header.msgType === MessageType.ToolError) {
+            try {
+                const body = JSON.parse(this.decryptIfNeeded(packet).toString('utf-8'));
+                const waiter = this.toolPending.get(body.id);
+                if (waiter) {
+                    this.toolPending.delete(body.id);
+                    waiter(packet);
+                    return;
+                }
+            } catch { /* fall through to the generic path */ }
+        }
 
-        this.sendPacket(packet);
+        const resolver = this.pendingResolvers.shift();
+        if (resolver) {
+            resolver(packet);
+            return;
+        }
 
-        // Wait for Auth Success/Failure
-        const response = await this.readNextPacket();
-
-        // Decrypt response
-        if (response.header.flags & PacketFlags.Encrypted) {
-            const plaintext = this.cryptoSession.decrypt(response);
-            if (response.header.msgType === MessageType.AuthSuccess) {
-                const user = JSON.parse(plaintext.toString());
-                console.log("Auth Successful:", user);
-                return;
-            } else if (response.header.msgType === MessageType.AuthFailure) {
-                const err = plaintext.toString();
-                throw new Error(`Authentication Failed: ${err}`);
+        if (packet.header.msgType === MessageType.TextMessage && this.messageHandler) {
+            try {
+                const text = this.decryptIfNeeded(packet).toString('utf-8');
+                const sender = packet.header.sessionId.toString('hex');
+                this.messageHandler(sender, text);
+            } catch {
+                // Undecryptable traffic is dropped.
             }
+            return;
         }
 
-        throw new Error("Unexpected packet during auth");
-    }
-
-    public async sendFile(filePath: string): Promise<void> {
-        if (!this.cryptoSession) throw new Error("Not connected secure");
-
-        const buffer = fs.readFileSync(filePath);
-        const filename = path.basename(filePath);
-        const size = buffer.length;
-        const fileId = uuidv4();
-
-        // Init
-        const initData = { id: fileId, filename: filename, size: size };
-        const initJson = JSON.stringify(initData);
-        await this.sendEncryptedRaw(MessageType.FileInit, Buffer.from(initJson));
-
-        // Chunks
-        const CHUNK_SIZE = 16384;
-        let offset = 0;
-        const fileIdBytes = uuidParse(fileId);
-        const fileIdBuf = Buffer.from(fileIdBytes as Uint8Array);
-
-        console.log(`Sending file ${filename} (${size} bytes) ID: ${fileId}`);
-
-        while (offset < size) {
-            const end = Math.min(offset + CHUNK_SIZE, size);
-            const chunkData = buffer.slice(offset, end);
-            const chunkPayload = Buffer.concat([fileIdBuf, chunkData]);
-
-            await this.sendEncryptedRaw(MessageType.FileChunk, chunkPayload);
-            offset += CHUNK_SIZE;
-            // throttle slightly
-            await new Promise(r => setTimeout(r, 2));
+        if (packet.header.msgType === MessageType.GameState && this.gameStateHandler) {
+            try {
+                const sender = packet.header.sessionId.toString('hex');
+                this.gameStateHandler(sender, this.parseGamePayload(packet));
+            } catch { /* dropped */ }
+            return;
         }
 
-        // Complete
-        await this.sendEncryptedRaw(MessageType.FileComplete, fileIdBuf);
-        console.log("File sent.");
+        this.inbox.push(packet);
+        if (this.inbox.length > 1024) this.inbox.shift();
     }
 
-    private async sendEncryptedRaw(type: MessageType, payload: Buffer): Promise<void> {
-        if (!this.cryptoSession) return;
+    private decryptIfNeeded(packet: Packet): Buffer {
+        if ((packet.header.flags & PacketFlags.Encrypted) !== 0) {
+            if (!this.cryptoSession) throw new Error('Encrypted packet without a session');
+            return this.cryptoSession.decrypt(packet);
+        }
+        return packet.payload;
+    }
+
+    private sendSecure(type: MessageType, payload: Buffer) {
+        if (!this.cryptoSession) throw new Error('Secure session not established (call connect() first)');
         const { ciphertext, authTag, sequence } = this.cryptoSession.encrypt(payload);
         const packet = this.createPacket(type, ciphertext);
         packet.header.flags |= PacketFlags.Encrypted;
@@ -404,48 +375,53 @@ export class AdaTPClient {
         this.sendPacket(packet);
     }
 
-    /**
-     * Reads the next incoming text message.
-     */
-    public async readNextTextMessage(): Promise<string> {
-        while (true) {
-            const packet = await this.readNextPacket();
-            if (packet.header.msgType === MessageType.TextMessage && this.cryptoSession) {
-                // Decrypt
-                if ((packet.header.flags & PacketFlags.Encrypted)) {
-                    // Using the existing pattern from line 279
-                    // Assuming 'Packet' object has all info including payload, tag, seq
-                    // But wait, the `packet` variable here IS a Packet object.
-                    const plaintext = this.cryptoSession.decrypt(packet);
-                    return plaintext.toString('utf-8');
-                }
-            }
-            // Ignore other packets or handle ping/pong?
+    private createPacket(type: MessageType, payload: Buffer): Packet {
+        return {
+            header: {
+                magic: MAGIC_NUMBER,
+                version: 1,
+                flags: 0,
+                length: payload.length,
+                sequence: 0n,
+                msgType: type,
+                timestamp: BigInt(Date.now()),
+                sessionId: this.sessionId
+            },
+            payload
+        };
+    }
+
+    private sendPacket(packet: Packet) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            throw new Error('WebSocket is not open');
         }
+        this.ws.send(PacketCodec.encode(packet));
     }
 
-    /**
-     * Closes the connection gracefully by sending a DISCONNECT packet.
-     */
-    public async disconnect(): Promise<void> {
-        const packet = this.createPacket(MessageType.Disconnect, Buffer.alloc(0));
-        this.sendPacket(packet);
-        console.log("Sent DISCONNECT");
-        this.socket.end();
-    }
-}
+    private parsePacketBytes(raw: Buffer): Packet {
+        const flags = raw.readUInt16LE(5);
+        const length = raw.readUInt32LE(7);
+        const payload = raw.subarray(HEADER_SIZE, HEADER_SIZE + length);
 
-async function main() {
-    const client = new AdaTPClient('127.0.0.1', 8443);
-    try {
-        await client.connect();
-        await client.sendTextMessage("Hello from Node.js!");
-        await client.disconnect();
-    } catch (e) {
-        console.error("Error:", e);
-    }
-}
+        let authTag: Buffer | undefined;
+        if ((flags & PacketFlags.Encrypted) !== 0) {
+            const tagStart = HEADER_SIZE + length;
+            authTag = raw.subarray(tagStart, tagStart + 16);
+        }
 
-if (require.main === module) {
-    main();
+        return {
+            header: {
+                magic: raw.readUInt32LE(0),
+                version: raw.readUInt8(4),
+                flags,
+                length,
+                sequence: raw.readBigUInt64LE(11),
+                msgType: raw.readUInt16LE(19),
+                timestamp: raw.readBigUInt64LE(21),
+                sessionId: Buffer.from(raw.subarray(29, 45))
+            },
+            payload,
+            authTag
+        };
+    }
 }
