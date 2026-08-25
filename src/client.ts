@@ -63,6 +63,8 @@ export class AdaTPClient {
     private gameStateHandler: ((sender: string, state: any) => void) | null = null;
     private toolPending = new Map<string, (p: Packet) => void>();
     private closed = false;
+    /** Set when the socket closes, so pending reads fail fast instead of hanging. */
+    private connClosed = false;
     /** Active SDK locale (normalized; falls back to 'en'). */
     public locale: string = 'en';
 
@@ -113,7 +115,14 @@ export class AdaTPClient {
                 this.handleIncoming(buf);
             });
             ws.on('error', (err) => reject(err));
-            ws.on('close', () => { this.closed = true; });
+            ws.on('close', () => {
+                this.closed = true;
+                this.connClosed = true;
+                // Unblock any pending reads (e.g. a handshake awaiting a response
+                // the server will never send because it closed the connection).
+                const waiters = this.pendingResolvers.splice(0);
+                waiters.forEach((r) => r(null as unknown as Packet));
+            });
         });
 
         await this.handshake();
@@ -377,7 +386,12 @@ export class AdaTPClient {
                 }, Math.max(1, deadline - Date.now()));
                 this.pendingResolvers.push(entry);
             });
-            if (!packet) break;
+            if (!packet) {
+                if (this.connClosed) {
+                    throw new Error('connection closed by server (possible protocol/version rejection)');
+                }
+                break;
+            }
             if (types.includes(packet.header.msgType)) return packet;
             this.inbox.push(packet);
         }
