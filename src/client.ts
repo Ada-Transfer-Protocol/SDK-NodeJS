@@ -7,6 +7,9 @@ import {
     MessageType, PacketFlags, MAGIC_NUMBER, HEADER_SIZE
 } from './protocol';
 import { CryptoSession } from './crypto';
+import {
+    PROTOCOL_V2, verifyServerHello, finishedPlaintext, normalizePinnedKey,
+} from './handshake_v2';
 
 export const ADATP_LOCALES = ['en', 'tr', 'it', 'fr', 'de', 'zh', 'ja', 'hi', 'ar'] as const;
 
@@ -18,6 +21,15 @@ export interface AdaTPClientOptions {
     /** SDK language for user-facing SDK strings. Default 'en'.
      *  The wire protocol is language-neutral; this is client-side metadata. */
     locale?: string;
+    /**
+     * The server's long-term Ed25519 identity public key (32 bytes as hex or a
+     * Buffer). Providing it **pins** the server and switches the handshake to
+     * the authenticated **protocol v2**: the client verifies the server's
+     * signature over the transcript before deriving any key, which defeats an
+     * active man-in-the-middle even without TLS. Omit it for the v1
+     * (unauthenticated) handshake, where TLS is required for that guarantee.
+     */
+    serverKey?: string | Buffer;
 }
 
 /**
@@ -42,6 +54,8 @@ export class AdaTPClient {
     private ws: WebSocket | null = null;
     private cryptoSession?: CryptoSession;
     private sessionId: Buffer;
+    /** Pinned server identity (32 bytes) → enables the v2 authenticated handshake. */
+    private pinnedServerKey?: Buffer;
 
     private pendingResolvers: Array<(p: Packet) => void> = [];
     private inbox: Packet[] = [];
@@ -64,6 +78,10 @@ export class AdaTPClient {
 
         this.locale = (ADATP_LOCALES as readonly string[]).includes(options.locale || '')
             ? (options.locale as string) : 'en';
+
+        if (options.serverKey !== undefined) {
+            this.pinnedServerKey = normalizePinnedKey(options.serverKey);
+        }
 
         this.sessionId = Buffer.alloc(16);
         Buffer.from(uuidParse(uuidv4())).copy(this.sessionId);
@@ -109,6 +127,12 @@ export class AdaTPClient {
         const myPubDer: Buffer = kp.publicKey.export({ format: 'der', type: 'spki' });
         const myRawPub = myPubDer.subarray(myPubDer.length - 32);
 
+        // When a server key is pinned, run the authenticated v2 handshake instead.
+        if (this.pinnedServerKey) {
+            await this.handshakeV2(kp, Buffer.from(myRawPub), diffieHellman, createPublicKey);
+            return;
+        }
+
         // 2. HANDSHAKE_INIT carries our public key.
         this.sendPacket(this.createPacket(MessageType.HandshakeInit, Buffer.from(myRawPub)));
 
@@ -138,6 +162,54 @@ export class AdaTPClient {
         const complete = this.createPacket(MessageType.HandshakeComplete, ciphertext);
         complete.header.flags |= PacketFlags.Encrypted;
         complete.header.sequence = sequence;
+        complete.authTag = authTag;
+        this.sendPacket(complete);
+    }
+
+    /**
+     * Protocol v2 — authenticated handshake against a pinned server identity.
+     * The server signs the transcript; we verify (pin + signature) BEFORE
+     * deriving keys, then send an encrypted Finished that binds the transcript.
+     * See {@link ./handshake_v2} and docs/spec/12-authenticated-handshake.md.
+     */
+    private async handshakeV2(
+        kp: any,
+        myRawPub: Buffer,
+        diffieHellman: (opts: any) => Buffer,
+        createPublicKey: (opts: any) => any,
+    ): Promise<void> {
+        // 1. HANDSHAKE_INIT (version=2) carries our ephemeral public key.
+        const init = this.createPacket(MessageType.HandshakeInit, myRawPub);
+        init.header.version = PROTOCOL_V2;
+        this.sendPacket(init);
+
+        // 2. HANDSHAKE_RESPONSE = epk_S || spk_S || sig. Verify pin + signature
+        //    against the transcript BEFORE deriving anything (throws on failure).
+        const response = await this.readNextPacketOfType([MessageType.HandshakeResponse]);
+        const verified = verifyServerHello(this.pinnedServerKey!, myRawPub, response.payload);
+
+        // 3. Only now derive the shared secret and session keys.
+        const secret = diffieHellman({
+            publicKey: createPublicKey({
+                key: Buffer.concat([
+                    Buffer.from('302a300506032b656e032100', 'hex'), // X25519 SPKI prefix
+                    verified.epkS,
+                ]),
+                format: 'der',
+                type: 'spki',
+            }),
+            privateKey: kp.privateKey,
+        });
+        this.cryptoSession = new CryptoSession('client', secret, true); // v2: bind header AAD
+
+        // 4. HANDSHAKE_COMPLETE carries the encrypted Finished = label || th,
+        //    proving we derived the same key for the same signed transcript.
+        //    Build the header (version=2) before encrypting so it is bound as AAD.
+        const fin = finishedPlaintext(verified.transcriptHash);
+        const complete = this.createPacket(MessageType.HandshakeComplete, Buffer.alloc(0));
+        complete.header.version = PROTOCOL_V2;
+        const { ciphertext, authTag } = this.cryptoSession.encrypt(fin, complete.header);
+        complete.payload = ciphertext;
         complete.authTag = authTag;
         this.sendPacket(complete);
     }
@@ -382,8 +454,11 @@ export class AdaTPClient {
 
     private sendSecure(type: MessageType, payload: Buffer) {
         if (!this.cryptoSession) throw new Error('Secure session not established (call connect() first)');
-        const { ciphertext, authTag, sequence } = this.cryptoSession.encrypt(payload);
-        const packet = this.createPacket(type, ciphertext);
+        // Build the header first so a v2 session can bind it as AEAD AAD.
+        const packet = this.createPacket(type, Buffer.alloc(0));
+        const { ciphertext, authTag, sequence } = this.cryptoSession.encrypt(payload, packet.header);
+        packet.payload = ciphertext;
+        packet.header.length = ciphertext.length;
         packet.header.flags |= PacketFlags.Encrypted;
         packet.header.sequence = sequence;
         packet.authTag = authTag;

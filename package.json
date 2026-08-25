@@ -6,7 +6,10 @@
     "types": "dist/index.d.ts",
     "scripts": {
         "build": "tsc",
-        "start": "ts-node src/index.ts"
+        "start": "ts-node src/index.ts",
+        "test": "npm run build && node test/handshake_v2.conformance.cjs",
+        "test:conformance": "npm run build && node test/handshake_v2.conformance.cjs",
+        "test:e2e": "npm run build && node test/e2e_v2.cjs"
     },
     "dependencies": {
         "@types/ws": "^8.18.1",
