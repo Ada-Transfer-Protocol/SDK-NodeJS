@@ -8,11 +8,16 @@ import {
 } from './protocol';
 import { CryptoSession } from './crypto';
 
+export const ADATP_LOCALES = ['en', 'tr', 'it', 'fr', 'de', 'zh', 'ja', 'hi', 'ar'] as const;
+
 export interface AdaTPClientOptions {
     /** WebSocket path on the server. Default: "/ws". */
     path?: string;
     /** Use wss:// instead of ws:// when constructing from host+port. */
     secure?: boolean;
+    /** SDK language for user-facing SDK strings. Default 'en'.
+     *  The wire protocol is language-neutral; this is client-side metadata. */
+    locale?: string;
 }
 
 /**
@@ -44,6 +49,8 @@ export class AdaTPClient {
     private gameStateHandler: ((sender: string, state: any) => void) | null = null;
     private toolPending = new Map<string, (p: Packet) => void>();
     private closed = false;
+    /** Active SDK locale (normalized; falls back to 'en'). */
+    public locale: string = 'en';
 
     constructor(hostOrUrl: string, port?: number, options: AdaTPClientOptions = {}) {
         if (hostOrUrl.startsWith('ws://') || hostOrUrl.startsWith('wss://')) {
@@ -55,8 +62,16 @@ export class AdaTPClient {
             this.url = `${scheme}://${hostOrUrl}:${p}${wsPath}`;
         }
 
+        this.locale = (ADATP_LOCALES as readonly string[]).includes(options.locale || '')
+            ? (options.locale as string) : 'en';
+
         this.sessionId = Buffer.alloc(16);
         Buffer.from(uuidParse(uuidv4())).copy(this.sessionId);
+    }
+
+    /** Switches the SDK language at runtime (one of ADATP_LOCALES). */
+    public setLocale(locale: string): void {
+        this.locale = (ADATP_LOCALES as readonly string[]).includes(locale) ? locale : 'en';
     }
 
     /** Client identity as sent in every packet header (hex). */
