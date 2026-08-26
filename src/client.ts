@@ -69,6 +69,8 @@ export class AdaTPClient {
     private messageHandler: ((sender: string, text: string) => void) | null = null;
     private gameStateHandler: ((sender: string, state: any) => void) | null = null;
     private toolPending = new Map<string, (p: Packet) => void>();
+    /** Pending reliable-delivery acks, keyed by the sent message's sequence. */
+    private ackPending = new Map<string, (delivered: number) => void>();
     private closed = false;
     /** Set when the socket closes, so pending reads fail fast instead of hanging. */
     private connClosed = false;
@@ -311,6 +313,30 @@ export class AdaTPClient {
         this.sendSecure(MessageType.TextMessage, Buffer.from(text, 'utf-8'));
     }
 
+    /**
+     * Sends a text message and resolves once the server confirms receipt with a
+     * delivery ack (the RELIABLE flag), or rejects if no ack arrives within
+     * `timeoutMs` (default 5000). `delivered` is the number of room members the
+     * server fanned the message out to on this node.
+     */
+    public sendTextMessageWithAck(
+        text: string,
+        timeoutMs = 5000,
+    ): Promise<{ delivered: number }> {
+        const seq = this.sendSecure(MessageType.TextMessage, Buffer.from(text, 'utf-8'), true);
+        const key = seq.toString();
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.ackPending.delete(key);
+                reject(new Error(`delivery ack timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+            this.ackPending.set(key, (delivered) => {
+                clearTimeout(timer);
+                resolve({ delivered });
+            });
+        });
+    }
+
     /** Streams a file to the current room (FileInit → FileChunk* → FileComplete). */
     public async sendFile(filePath: string): Promise<void> {
         const buffer = fs.readFileSync(filePath);
@@ -524,6 +550,21 @@ export class AdaTPClient {
             } catch { /* fall through to the generic path */ }
         }
 
+        // Delivery acks are correlated by the original message's sequence and
+        // resolve sendTextMessageWithAck() — they never enter the general queue.
+        if (packet.header.msgType === MessageType.TextAck) {
+            try {
+                const body = JSON.parse(this.decryptIfNeeded(packet).toString('utf-8'));
+                const key = String(body.seq);
+                const waiter = this.ackPending.get(key);
+                if (waiter) {
+                    this.ackPending.delete(key);
+                    waiter(typeof body.delivered === 'number' ? body.delivered : 0);
+                    return;
+                }
+            } catch { /* fall through to the generic path */ }
+        }
+
         const resolver = this.pendingResolvers.shift();
         if (resolver) {
             resolver(packet);
@@ -561,10 +602,12 @@ export class AdaTPClient {
         return packet.payload;
     }
 
-    private sendSecure(type: MessageType, payload: Buffer) {
+    private sendSecure(type: MessageType, payload: Buffer, reliable = false): bigint {
         if (!this.cryptoSession) throw new Error('Secure session not established (call connect() first)');
-        // Build the header first so a v2 session can bind it as AEAD AAD.
+        // Build the header first so a v2 session can bind it as AEAD AAD. The
+        // RELIABLE flag must be set before encryption so it is part of that AAD.
         const packet = this.createPacket(type, Buffer.alloc(0));
+        if (reliable) packet.header.flags |= PacketFlags.Reliable;
         const { ciphertext, authTag, sequence } = this.cryptoSession.encrypt(payload, packet.header);
         packet.payload = ciphertext;
         packet.header.length = ciphertext.length;
@@ -572,6 +615,7 @@ export class AdaTPClient {
         packet.header.sequence = sequence;
         packet.authTag = authTag;
         this.sendPacket(packet);
+        return sequence;
     }
 
     private createPacket(type: MessageType, payload: Buffer): Packet {
