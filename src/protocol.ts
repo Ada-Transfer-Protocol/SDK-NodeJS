@@ -21,17 +21,22 @@ export enum MessageType {
     VoiceIce = 0x0043,
     VoiceData = 0x0044,
     VoiceEnd = 0x0045,
-    VideoInit = 0x0050,
-    VideoOffer = 0x0051,
-    VideoAnswer = 0x0052,
-    VideoData = 0x0053,
-    VideoEnd = 0x0054,
+    GameState = 0x0050,
     PresenceUpdate = 0x0060,
     TypingIndicator = 0x0061,
+    ToolCall = 0x0070,
+    ToolResult = 0x0071,
+    ToolError = 0x0072,
+    Ping = 0x0080,
+    Pong = 0x0081,
+    VideoInit = 0x0090,
+    VideoOffer = 0x0091,
+    VideoAnswer = 0x0092,
+    VideoData = 0x0093,
+    VideoEnd = 0x0094,
     JoinRoom = 0x00A0,
     RoomJoined = 0x00A1,
-    Ping = 0x0070,
-    Pong = 0x0071,
+    ClientEvent = 0x00A2,
     Disconnect = 0x00FF
 }
 
@@ -63,49 +68,29 @@ export interface Packet {
 }
 
 export class Codec {
-    static encode(packet: Packet): Buffer {
-        const payloadLen = packet.payload.length;
-        const authTagLen = packet.authTag ? 16 : 0;
-        const totalLen = HEADER_SIZE + payloadLen + authTagLen;
-
-        const buf = Buffer.alloc(totalLen);
+    /**
+     * The 45-byte header, serialized exactly as on the wire. Also used, in
+     * protocol v2, as the AEAD additional authenticated data — so it must be
+     * byte-identical to the server's `PacketHeader::header_bytes()`.
+     */
+    static encodeHeader(header: PacketHeader): Buffer {
+        const buf = Buffer.alloc(HEADER_SIZE);
         let offset = 0;
-
-        // Magic (4) - Little Endian !
-        buf.writeUInt32LE(packet.header.magic, offset); offset += 4;
-
-        // Version (1)
-        buf.writeUInt8(packet.header.version, offset); offset += 1;
-
-        // Flags (2)
-        buf.writeUInt16LE(packet.header.flags, offset); offset += 2;
-
-        // Length (4)
-        buf.writeUInt32LE(packet.header.length, offset); offset += 4;
-
-        // Sequence (8)
-        buf.writeBigUInt64LE(packet.header.sequence, offset); offset += 8;
-
-        // MsgType (2)
-        buf.writeUInt16LE(packet.header.msgType, offset); offset += 2;
-
-        // Timestamp (8)
-        buf.writeBigUInt64LE(packet.header.timestamp, offset); offset += 8;
-
-        // SessionID (16)
-        packet.header.sessionId.copy(buf, offset); offset += 16;
-
-        // Payload
-        packet.payload.copy(buf, offset); offset += packet.payload.length;
-
-        // AuthTag
-        if (packet.authTag) {
-            packet.authTag.copy(buf, offset);
-        }
-
+        buf.writeUInt32LE(header.magic, offset); offset += 4;       // Magic (4) LE
+        buf.writeUInt8(header.version, offset); offset += 1;        // Version (1)
+        buf.writeUInt16LE(header.flags, offset); offset += 2;       // Flags (2)
+        buf.writeUInt32LE(header.length, offset); offset += 4;      // Length (4)
+        buf.writeBigUInt64LE(header.sequence, offset); offset += 8; // Sequence (8)
+        buf.writeUInt16LE(header.msgType, offset); offset += 2;     // MsgType (2)
+        buf.writeBigUInt64LE(header.timestamp, offset); offset += 8;// Timestamp (8)
+        header.sessionId.copy(buf, offset);                        // SessionID (16)
         return buf;
     }
 
-    // Incomplete, just structure definition for now.
-    // Full parsing logic will be in Connection class or similar.
+    static encode(packet: Packet): Buffer {
+        const header = Codec.encodeHeader(packet.header);
+        const parts: Buffer[] = [header, packet.payload];
+        if (packet.authTag) parts.push(packet.authTag);
+        return Buffer.concat(parts);
+    }
 }

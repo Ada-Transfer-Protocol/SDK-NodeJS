@@ -1,0 +1,84 @@
+{
+  "name": "AdaTP v2 authenticated-handshake golden vectors",
+  "version": 2,
+  "status": "PROPOSED — matches docs/spec/12-authenticated-handshake.md and the ProVerif model in docs/spec/formal/. v2 is design+reference-crypto only; not yet negotiated end-to-end across all SDKs. See ROADMAP.md.",
+  "notes": [
+    "All inputs are fixed so the vectors are fully deterministic (Ed25519 signing is deterministic; the transcript hash is a pure function of the three public keys).",
+    "The server's long-term identity is the Ed25519 key with the 32-byte SEED below; its public key is spk_s. Clients PIN spk_s out of band (spec 12 §4).",
+    "th = SHA-256( LABEL_HS || u8(2) || epk_c || epk_s || spk_s ), signed by the server: sig = Ed25519_sign(ssk_s, th).",
+    "A client MUST reject the ServerHello unless (a) spk_s equals its pinned key AND (b) the signature verifies over th. This is what closes the v1 MITM."
+  ],
+  "constants": {
+    "protocol_version": 2,
+    "label_hs_utf8": "AdaTP-v2-handshake",
+    "label_hs_hex": "41646154502d76322d68616e647368616b65",
+    "finished_label_utf8": "AdaTP-v2-finished",
+    "finished_label_hex": "41646154502d76322d66696e6973686564"
+  },
+  "cases": [
+    {
+      "id": "handshake-v2-transcript-hash",
+      "description": "SHA-256 transcript hash th over (label || u8(2) || epk_c || epk_s || spk_s)",
+      "input": {
+        "server_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "spk_s_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "epk_c_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+        "epk_s_hex": "0202020202020202020202020202020202020202020202020202020202020202"
+      },
+      "expected": {
+        "transcript_preimage_hex": "41646154502d76322d68616e647368616b6502010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020202d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "transcript_hash_hex": "c1160ba8a8f18442927b9b70db0cd8ebab8c6ddfd5a1b8b1ea5ad2db86dc47e1"
+      }
+    },
+    {
+      "id": "handshake-v2-server-hello",
+      "description": "Signed ServerHello wire = epk_s(32) || spk_s(32) || sig(64) = 128 bytes; the client verifies (pin + signature) before deriving keys",
+      "input": {
+        "server_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "epk_c_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+        "epk_s_hex": "0202020202020202020202020202020202020202020202020202020202020202"
+      },
+      "expected": {
+        "signature_hex": "d4fb201f891dc7136de3970189638f39aa6218860e047938befb5528ed85f9ee98dfdf2421f6ce3d62343b92ff8229f13d03ee03811f74a7e2f07f655da3830b",
+        "server_hello_hex": "0202020202020202020202020202020202020202020202020202020202020202d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737d4fb201f891dc7136de3970189638f39aa6218860e047938befb5528ed85f9ee98dfdf2421f6ce3d62343b92ff8229f13d03ee03811f74a7e2f07f655da3830b",
+        "client_verify": "accept"
+      }
+    },
+    {
+      "id": "handshake-v2-server-hello-wrong-pin",
+      "description": "Same ServerHello, but the client pinned a DIFFERENT server key — MUST be rejected as an unknown identity (this is what stops a validly self-signed MITM)",
+      "input": {
+        "pinned_spk_s_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "epk_c_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+        "server_hello_hex": "0202020202020202020202020202020202020202020202020202020202020202d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737d4fb201f891dc7136de3970189638f39aa6218860e047938befb5528ed85f9ee98dfdf2421f6ce3d62343b92ff8229f13d03ee03811f74a7e2f07f655da3830b"
+      },
+      "expected": {
+        "client_verify": "reject",
+        "reason": "unknown_identity"
+      }
+    },
+    {
+      "id": "handshake-v2-server-hello-tampered-ephemeral",
+      "description": "Attacker keeps the real spk_s (pin passes) but substitutes its own epk_s — the signature no longer covers this transcript, MUST be rejected",
+      "input": {
+        "pinned_spk_s_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "epk_c_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+        "server_hello_hex": "0303030303030303030303030303030303030303030303030303030303030303d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737d4fb201f891dc7136de3970189638f39aa6218860e047938befb5528ed85f9ee98dfdf2421f6ce3d62343b92ff8229f13d03ee03811f74a7e2f07f655da3830b"
+      },
+      "expected": {
+        "client_verify": "reject",
+        "reason": "signature_verification_failed"
+      }
+    },
+    {
+      "id": "handshake-v2-finished",
+      "description": "Client key-confirmation plaintext = FINISHED_LABEL || th, sent ENCRYPTED under the session key as HandshakeComplete",
+      "input": {
+        "transcript_hash_hex": "c1160ba8a8f18442927b9b70db0cd8ebab8c6ddfd5a1b8b1ea5ad2db86dc47e1"
+      },
+      "expected": {
+        "finished_plaintext_hex": "41646154502d76322d66696e6973686564c1160ba8a8f18442927b9b70db0cd8ebab8c6ddfd5a1b8b1ea5ad2db86dc47e1"
+      }
+    }
+  ]
+}

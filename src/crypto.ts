@@ -1,7 +1,7 @@
 import { diffieHellman } from 'crypto';
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
-import { Packet, PacketFlags } from './protocol';
+import { Packet, PacketFlags, PacketHeader, Codec } from './protocol';
 
 export class CryptoSession {
     private clientWriteKey: Buffer;
@@ -13,9 +13,12 @@ export class CryptoSession {
     private peerSequence: bigint = 1n;
 
     private role: 'client' | 'server';
+    /** v2: bind the 45-byte frame header as AEAD AAD. v1 leaves it empty. */
+    private bindAad: boolean;
 
-    constructor(role: 'client' | 'server', sharedSecret: Buffer) {
+    constructor(role: 'client' | 'server', sharedSecret: Buffer, bindAad: boolean = false) {
         this.role = role;
+        this.bindAad = bindAad;
         // Derive keys
         // Using sync HKDF for simplicity implementation, assuming 'hkdf' package supports it or wrapper.
         // Actually 'hkdf' is usually async or callback based in some libs.
@@ -43,13 +46,28 @@ export class CryptoSession {
         this.serverIvRoot = Buffer.from(hkdfSync('sha256', sharedSecret, salt, 'server_iv', 12));
     }
 
-    public encrypt(plaintext: Buffer): { ciphertext: Buffer, authTag: Buffer, sequence: bigint } {
+    /**
+     * Encrypts `plaintext`. When a `header` is supplied and this is a v2 session,
+     * the header's sequence/length/ENCRYPTED-flag are finalized and the header is
+     * bound as AEAD AAD (tamper-evident). v1 sessions ignore the header and use
+     * empty AAD, so their wire bytes are unchanged.
+     */
+    public encrypt(plaintext: Buffer, header?: PacketHeader): { ciphertext: Buffer, authTag: Buffer, sequence: bigint } {
         const seq = this.mySequence;
         const iv = this.computeIv(seq, this.role);
 
         const key = this.role === 'client' ? this.clientWriteKey : this.serverWriteKey;
 
+        let aad: Buffer = Buffer.alloc(0);
+        if (this.bindAad && header) {
+            header.sequence = seq;
+            header.length = plaintext.length;
+            header.flags |= PacketFlags.Encrypted;
+            aad = Codec.encodeHeader(header);
+        }
+
         const cipher = createCipheriv('aes-256-gcm', key, iv);
+        if (aad.length > 0) cipher.setAAD(aad);
         const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
         const authTag = cipher.getAuthTag();
 
@@ -71,6 +89,8 @@ export class CryptoSession {
         if (!packet.authTag) throw new Error("Missing auth tag");
 
         const decipher = createDecipheriv('aes-256-gcm', key, iv);
+        // v2 binds the received header as AAD; any header tampering fails the tag.
+        if (this.bindAad) decipher.setAAD(Codec.encodeHeader(packet.header));
         decipher.setAuthTag(packet.authTag);
 
         const plaintext = Buffer.concat([decipher.update(packet.payload), decipher.final()]);

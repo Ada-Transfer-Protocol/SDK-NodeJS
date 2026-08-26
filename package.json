@@ -1,16 +1,21 @@
 {
     "name": "adatp",
-    "version": "0.1.0",
+    "version": "1.0.0",
     "description": "Ada Transport Protocol SDK for Node.js",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "scripts": {
         "build": "tsc",
-        "start": "ts-node src/index.ts"
+        "start": "ts-node src/index.ts",
+        "test": "npm run build && node test/handshake_v2.conformance.cjs",
+        "test:conformance": "npm run build && node test/handshake_v2.conformance.cjs",
+        "test:e2e": "npm run build && node test/e2e_v2.cjs"
     },
     "dependencies": {
+        "@types/ws": "^8.18.1",
         "hkdf": "^0.0.2",
-        "uuid": "^13.0.0"
+        "uuid": "^13.0.0",
+        "ws": "^8.21.3"
     },
     "devDependencies": {
         "@types/node": "^25.0.10",

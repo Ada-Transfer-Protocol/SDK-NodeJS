@@ -24,7 +24,7 @@ import { AdaTPClient } from './src/client';
 
 async function main() {
     // 1. Initialize
-    const client = new AdaTPClient('127.0.0.1', 8444);
+    const client = new AdaTPClient('127.0.0.1', 3000);
 
     try {
         // 2. Connect & Handshake
@@ -72,4 +72,15 @@ Receiving involves listening for packet types. See `filetransfer_example.ts` for
 
 ## 🔧 Configuration
 
-The client connects to `127.0.0.1:8444` by default. Ensure your AdaTP server is running and accessible.
+The client connects to `ws://127.0.0.1:3000/ws` (WebSocket) by default. A full URL is also accepted: `new AdaTPClient("wss://example.com/ws")`. Ensure your AdaTP server is running and accessible.
+
+## Language / locale
+
+The client takes a `locale` option for its user-facing strings (client-side
+metadata — the wire protocol is language-neutral). Default `en`; supported:
+`en tr it fr de zh ja hi ar`.
+
+```ts
+const client = new AdaTPClient('127.0.0.1', 3000, { locale: 'tr' });
+client.setLocale('de'); // switch at runtime
+```
