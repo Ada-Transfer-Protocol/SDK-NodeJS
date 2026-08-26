@@ -36,6 +36,7 @@ export enum MessageType {
     VideoEnd = 0x0094,
     JoinRoom = 0x00A0,
     RoomJoined = 0x00A1,
+    ClientEvent = 0x00A2,
     Disconnect = 0x00FF
 }
 

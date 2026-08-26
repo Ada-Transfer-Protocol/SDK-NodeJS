@@ -372,6 +372,26 @@ export class AdaTPClient {
     }
 
     /**
+     * Sends a client event (a "whisper") to the *other* members of the current
+     * private/presence room — never echoed back to the sender, never persisted.
+     * The name is forced to the `client-*` namespace. The server drops the whisper
+     * if the current room is public, so only call this while in a `private-`/`presence-` room.
+     */
+    public whisper(event: string, data: unknown = {}): void {
+        const name = event.startsWith('client-') ? event : `client-${event}`;
+        const payload = Buffer.from(JSON.stringify({ event: name, data }), 'utf-8');
+        this.sendSecure(MessageType.ClientEvent, payload);
+    }
+
+    /** Resolves with the next client event `{event, data}` whispered by another member. */
+    public async readNextClientEvent(
+        timeoutMs = 10000,
+    ): Promise<{ event: string; data: any }> {
+        const packet = await this.readNextPacketOfType([MessageType.ClientEvent], timeoutMs);
+        return JSON.parse(this.decryptIfNeeded(packet).toString('utf-8'));
+    }
+
+    /**
      * Resolves with the next rich presence event on a `presence-*` room, decrypted
      * and parsed: `{event:"presence:here", members:[...]}` for the roster the
      * server sends on join, then `{event:"presence:member_added"|"presence:member_removed", member:{...}}`.
