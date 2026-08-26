@@ -30,6 +30,13 @@ export interface AdaTPClientOptions {
      * (unauthenticated) handshake, where TLS is required for that guarantee.
      */
     serverKey?: string | Buffer;
+    /**
+     * Reuse a fixed session id (16-byte hex, e.g. from a previous connection's
+     * `getSessionId()`) instead of generating a fresh one. Pass the old id when
+     * reconnecting so the server can replay the messages missed while offline —
+     * see `joinRoom(room, {recover:true})`. Default: a new random id per client.
+     */
+    sessionId?: string;
 }
 
 /**
@@ -86,7 +93,15 @@ export class AdaTPClient {
         }
 
         this.sessionId = Buffer.alloc(16);
-        Buffer.from(uuidParse(uuidv4())).copy(this.sessionId);
+        if (options.sessionId) {
+            const raw = Buffer.from(options.sessionId.replace(/-/g, ''), 'hex');
+            if (raw.length !== 16) {
+                throw new Error('sessionId must be 16 bytes (32 hex chars)');
+            }
+            raw.copy(this.sessionId);
+        } else {
+            Buffer.from(uuidParse(uuidv4())).copy(this.sessionId);
+        }
     }
 
     /** Switches the SDK language at runtime (one of ADATP_LOCALES). */
@@ -260,12 +275,28 @@ export class AdaTPClient {
     }
 
     /** Joins a room; resolves once the server confirms with RoomJoined. */
-    public async joinRoom(room: string, grant?: string): Promise<string> {
-        // A bare room name, or {room, grant} when a private/presence channel
-        // needs the signed grant from the app server's /broadcasting/auth.
-        const payload = grant
-            ? Buffer.from(JSON.stringify({ room, grant }), 'utf-8')
-            : Buffer.from(room, 'utf-8');
+    public async joinRoom(
+        room: string,
+        opts?: string | { grant?: string; recover?: boolean },
+    ): Promise<string> {
+        // Back-compatible: a bare string second arg is the channel-auth grant.
+        const o = typeof opts === 'string' ? { grant: opts } : (opts ?? {});
+        // A bare room name, or {room, grant?, recover?}: `grant` carries the
+        // signed token from the app server's /broadcasting/auth for a
+        // private/presence channel; `recover` asks the server to replay the
+        // TextMessages this session missed while disconnected (reuse the prior
+        // session id via the `sessionId` client option for this to match).
+        const payload =
+            o.grant || o.recover
+                ? Buffer.from(
+                      JSON.stringify({
+                          room,
+                          ...(o.grant ? { grant: o.grant } : {}),
+                          ...(o.recover ? { recover: true } : {}),
+                      }),
+                      'utf-8',
+                  )
+                : Buffer.from(room, 'utf-8');
         this.sendSecure(MessageType.JoinRoom, payload);
         const response = await this.readNextPacketOfType([MessageType.RoomJoined, MessageType.AuthFailure]);
         const plaintext = this.decryptIfNeeded(response);
