@@ -225,10 +225,29 @@ export class AdaTPClient {
 
     /**
      * Sends credentials; resolves with the server-assigned identity or throws
-     * on AuthFailure.
+     * on AuthFailure. Pass a username+password, or a single `auth_string`
+     * (token/session/API key) matching the server's auth mode.
      */
     public async authenticate(username: string, password: string): Promise<{ user_id: string, username: string, role: string }> {
         const body = Buffer.from(JSON.stringify({ username, password }), 'utf-8');
+        this.sendSecure(MessageType.AuthRequest, body);
+
+        const response = await this.readNextPacketOfType([MessageType.AuthSuccess, MessageType.AuthFailure]);
+        const plaintext = this.decryptIfNeeded(response);
+
+        if (response.header.msgType === MessageType.AuthSuccess) {
+            return JSON.parse(plaintext.toString('utf-8'));
+        }
+        throw new Error(`Authentication failed: ${plaintext.toString('utf-8')}`);
+    }
+
+    /**
+     * Authenticate with a single credential string (a token, session id or API
+     * key) instead of username+password — for servers whose auth mode expects an
+     * `auth_string` (file-driver token, external webhook, etc.).
+     */
+    public async authenticateWithString(authString: string): Promise<{ user_id: string, username: string, role: string }> {
+        const body = Buffer.from(JSON.stringify({ auth_string: authString }), 'utf-8');
         this.sendSecure(MessageType.AuthRequest, body);
 
         const response = await this.readNextPacketOfType([MessageType.AuthSuccess, MessageType.AuthFailure]);
