@@ -260,8 +260,13 @@ export class AdaTPClient {
     }
 
     /** Joins a room; resolves once the server confirms with RoomJoined. */
-    public async joinRoom(room: string): Promise<string> {
-        this.sendSecure(MessageType.JoinRoom, Buffer.from(room, 'utf-8'));
+    public async joinRoom(room: string, grant?: string): Promise<string> {
+        // A bare room name, or {room, grant} when a private/presence channel
+        // needs the signed grant from the app server's /broadcasting/auth.
+        const payload = grant
+            ? Buffer.from(JSON.stringify({ room, grant }), 'utf-8')
+            : Buffer.from(room, 'utf-8');
+        this.sendSecure(MessageType.JoinRoom, payload);
         const response = await this.readNextPacketOfType([MessageType.RoomJoined, MessageType.AuthFailure]);
         const plaintext = this.decryptIfNeeded(response);
         if (response.header.msgType === MessageType.RoomJoined) {
