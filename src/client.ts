@@ -371,6 +371,26 @@ export class AdaTPClient {
         return result.tools ?? [];
     }
 
+    /**
+     * Resolves with the next rich presence event on a `presence-*` room, decrypted
+     * and parsed: `{event:"presence:here", members:[...]}` for the roster the
+     * server sends on join, then `{event:"presence:member_added"|"presence:member_removed", member:{...}}`.
+     * The coarse legacy JOIN/LEAVE PresenceUpdate signals are skipped.
+     */
+    public async readNextPresence(timeoutMs = 10000): Promise<any> {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            const packet = await this.readNextPacketOfType(
+                [MessageType.PresenceUpdate],
+                Math.max(1, deadline - Date.now()),
+            );
+            const text = this.decryptIfNeeded(packet).toString('utf-8');
+            if (text.startsWith('{')) return JSON.parse(text); // rich event
+            // else: legacy coarse "JOIN"/"LEAVE" — skip, keep waiting.
+        }
+        throw new Error('Timeout waiting for a presence event');
+    }
+
     /** Resolves with the next decrypted TextMessage (skips other packets). */
     public async readNextTextMessage(): Promise<string> {
         while (true) {
